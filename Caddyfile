@@ -1,0 +1,3 @@
+uploadandask.com, www.uploadandask.com {
+    reverse_proxy app:8501
+}

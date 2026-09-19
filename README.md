@@ -33,6 +33,10 @@ Upload a PDF, ask questions about it, and get answers grounded in the document's
 
 4. Open the URL Streamlit prints (usually http://localhost:8501), upload a PDF, and start asking questions.
 
+## Deploying it publicly
+
+See [DEPLOY.md](DEPLOY.md) for step-by-step instructions to run this on AWS at `uploadandask.com`.
+
 ## Notes
 
 - Everything is kept in-memory for the current session — nothing is persisted to disk. Uploading a new PDF re-indexes and replaces the previous one.
