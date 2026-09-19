@@ -37,4 +37,3 @@ Upload a PDF, ask questions about it, and get answers grounded in the document's
 
 - Everything is kept in-memory for the current session — nothing is persisted to disk. Uploading a new PDF re-indexes and replaces the previous one.
 - Scanned PDFs without a text layer won't extract any text (no OCR step); use a text-based PDF or add OCR pre-processing if you need that.
-- The `knowledge/` and `patterns/` folders are reference examples (Docling-based RAG pipeline and LLM workflow patterns) that informed this app's design — they aren't part of the running app.
