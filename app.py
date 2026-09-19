@@ -17,7 +17,9 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
 CHUNK_TOKENS = 500
 CHUNK_OVERLAP = 75
-TOP_K = 4
+TOP_K = 8
+FETCH_K = 25
+MMR_LAMBDA = 0.5
 
 client = OpenAI()
 encoding = tiktoken.get_encoding("cl100k_base")
@@ -59,11 +61,41 @@ def embed_texts(texts: List[str]) -> np.ndarray:
     return vectors / norms
 
 
-def search(query: str, chunks: List[dict], embeddings: np.ndarray, k: int = TOP_K) -> List[dict]:
+def search(
+    query: str,
+    chunks: List[dict],
+    embeddings: np.ndarray,
+    k: int = TOP_K,
+    fetch_k: int = FETCH_K,
+    lambda_mult: float = MMR_LAMBDA,
+) -> List[dict]:
+    """Retrieve chunks via Maximal Marginal Relevance: relevant to the query, but
+    diverse from each other, so a broad question (e.g. "what are the important
+    things to consider?") pulls a spread of the document instead of several
+    near-duplicate passages from the single most similar section."""
     query_vec = embed_texts([query])[0]
-    scores = embeddings @ query_vec
-    top_indices = np.argsort(scores)[::-1][:k]
-    return [chunks[i] for i in top_indices]
+    sims_to_query = embeddings @ query_vec
+
+    fetch_k = min(fetch_k, len(chunks))
+    k = min(k, len(chunks))
+    candidates = list(np.argsort(sims_to_query)[::-1][:fetch_k])
+
+    selected: List[int] = []
+    while candidates and len(selected) < k:
+        if not selected:
+            best = candidates[0]
+        else:
+            selected_vecs = embeddings[selected]
+            best, best_score = None, -np.inf
+            for idx in candidates:
+                redundancy = np.max(embeddings[idx] @ selected_vecs.T)
+                score = lambda_mult * sims_to_query[idx] - (1 - lambda_mult) * redundancy
+                if score > best_score:
+                    best, best_score = idx, score
+        selected.append(best)
+        candidates.remove(best)
+
+    return [chunks[i] for i in selected]
 
 
 def build_context(results: List[dict]) -> str:
@@ -76,8 +108,16 @@ def build_context(results: List[dict]) -> str:
 def get_chat_response(messages: List[dict], context: str):
     system_prompt = (
         "You are a helpful assistant that answers questions using only the provided "
-        "excerpts from a PDF document. Cite the page number(s) you used, like (p. 3). "
-        "If the excerpts don't contain the answer, say you couldn't find it in the document."
+        "excerpts from a PDF document. Cite the page number(s) you used, like (p. 3).\n\n"
+        "For broad or open-ended questions (e.g. 'what are the important things to "
+        "consider', 'summarize this', 'what should I watch out for'), don't require an "
+        "excerpt to literally contain that phrasing — instead synthesize across ALL the "
+        "excerpts below and surface anything a reader would want to know: obligations, "
+        "costs or fees, deadlines, liability, termination or renewal terms, restrictions, "
+        "and similar noteworthy points. Present it as a short list, each item citing its "
+        "page.\n\n"
+        "Only say you couldn't find an answer if the excerpts truly have nothing relevant "
+        "to draw on."
         f"\n\nExcerpts:\n{context}"
     )
     stream = client.chat.completions.create(
