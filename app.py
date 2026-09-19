@@ -2,7 +2,11 @@
 
 import hashlib
 import io
-from typing import List
+import os
+import threading
+from collections import OrderedDict
+from datetime import date
+from typing import List, Optional, Tuple
 
 import numpy as np
 import streamlit as st
@@ -24,10 +28,55 @@ MMR_LAMBDA = 0.5
 MAX_PAGES = 7
 MAX_FILE_MB = 10
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+MAX_SESSION_QUESTIONS = int(os.environ.get("MAX_SESSION_QUESTIONS", "10"))
+MAX_DAILY_REQUESTS = int(os.environ.get("MAX_DAILY_REQUESTS", "200"))
+PDF_CACHE_MAX_ENTRIES = 50
 
 client = OpenAI()
 ade_client = LandingAIADE()  # reads VISION_AGENT_API_KEY
 encoding = tiktoken.get_encoding("cl100k_base")
+
+# Process-wide (shared across all sessions) usage tracking. A plain dict guarded by a
+# lock is enough here since this runs as a single process on a single instance; it
+# would need a real store (Redis/DB) behind a load balancer with multiple workers.
+_usage_lock = threading.Lock()
+_usage_state = {"date": date.today(), "count": 0}
+
+_pdf_cache_lock = threading.Lock()
+_pdf_cache: "OrderedDict[str, Tuple[List[dict], np.ndarray]]" = OrderedDict()
+
+
+def consume_global_quota() -> bool:
+    """Returns False once the shared daily request cap is hit, so a spike in traffic
+    (or abuse) can't run up an unbounded OpenAI/LandingAI bill. Every call that spends
+    money (a PDF parse+embed, or a question) must go through this first."""
+    with _usage_lock:
+        today = date.today()
+        if _usage_state["date"] != today:
+            _usage_state["date"] = today
+            _usage_state["count"] = 0
+        if _usage_state["count"] >= MAX_DAILY_REQUESTS:
+            return False
+        _usage_state["count"] += 1
+        return True
+
+
+def get_cached_pdf(file_hash: str) -> Optional[Tuple[List[dict], np.ndarray]]:
+    """Shared across sessions/users: if someone else already uploaded this exact file
+    (common for popular T&Cs/contracts), skip paying for ADE parsing + embeddings again."""
+    with _pdf_cache_lock:
+        cached = _pdf_cache.get(file_hash)
+        if cached is not None:
+            _pdf_cache.move_to_end(file_hash)
+        return cached
+
+
+def set_cached_pdf(file_hash: str, value: Tuple[List[dict], np.ndarray]) -> None:
+    with _pdf_cache_lock:
+        _pdf_cache[file_hash] = value
+        _pdf_cache.move_to_end(file_hash)
+        while len(_pdf_cache) > PDF_CACHE_MAX_ENTRIES:
+            _pdf_cache.popitem(last=False)
 
 
 def get_page_count(file_bytes: bytes) -> int:
@@ -151,7 +200,15 @@ def get_chat_response(messages: List[dict], context: str):
     return st.write_stream(stream)
 
 
-def process_pdf(filename: str, file_bytes: bytes):
+def process_pdf(filename: str, file_bytes: bytes, file_hash: str):
+    cached = get_cached_pdf(file_hash)
+    if cached is not None:
+        return cached
+
+    if not file_bytes.startswith(b"%PDF-"):
+        st.error("This doesn't look like a valid PDF file.")
+        return None, None
+
     if len(file_bytes) > MAX_FILE_BYTES:
         size_mb = len(file_bytes) / (1024 * 1024)
         st.error(f"This file is {size_mb:.1f} MB, over the {MAX_FILE_MB} MB limit.")
@@ -167,6 +224,10 @@ def process_pdf(filename: str, file_bytes: bytes):
         st.error(f"This PDF has {page_count} pages; the limit is {MAX_PAGES} pages for now.")
         return None, None
 
+    if not consume_global_quota():
+        st.error(f"We've hit today's usage limit ({MAX_DAILY_REQUESTS} requests). Please try again tomorrow.")
+        return None, None
+
     with st.spinner("Reading and indexing PDF..."):
         pages = extract_pages(filename, file_bytes)
         chunks = chunk_pages(pages)
@@ -174,6 +235,8 @@ def process_pdf(filename: str, file_bytes: bytes):
             st.error("Couldn't extract any text from this PDF. It may be scanned images without a text layer.")
             return None, None
         embeddings = embed_texts([c["text"] for c in chunks])
+
+    set_cached_pdf(file_hash, (chunks, embeddings))
     return chunks, embeddings
 
 
@@ -181,12 +244,17 @@ def main():
     st.set_page_config(page_title="PDF Q&A", page_icon="📄")
     st.title("📄 PDF Upload & Ask")
     st.caption("Upload a PDF, then ask questions about its contents.")
+    st.caption(
+        "Your document's content is sent to OpenAI and LandingAI for processing — "
+        "avoid uploading anything highly sensitive."
+    )
 
     if "file_hash" not in st.session_state:
         st.session_state.file_hash = None
         st.session_state.chunks = None
         st.session_state.embeddings = None
         st.session_state.messages = []
+        st.session_state.question_count = 0
 
     uploaded_file = st.file_uploader(
         "Upload a PDF",
@@ -199,11 +267,12 @@ def main():
         file_hash = hashlib.sha256(file_bytes).hexdigest()
 
         if file_hash != st.session_state.file_hash:
-            chunks, embeddings = process_pdf(uploaded_file.name, file_bytes)
+            chunks, embeddings = process_pdf(uploaded_file.name, file_bytes, file_hash)
             st.session_state.file_hash = file_hash
             st.session_state.chunks = chunks
             st.session_state.embeddings = embeddings
             st.session_state.messages = []
+            st.session_state.question_count = 0
             if chunks:
                 st.success(f"Indexed {len(chunks)} chunks from {uploaded_file.name}.")
 
@@ -219,6 +288,21 @@ def main():
         with st.chat_message("user"):
             st.markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
+
+        if st.session_state.question_count >= MAX_SESSION_QUESTIONS:
+            with st.chat_message("assistant"):
+                st.warning(
+                    f"You've reached the {MAX_SESSION_QUESTIONS}-question limit for this "
+                    "session. Refresh the page to start a new one."
+                )
+            return
+
+        if not consume_global_quota():
+            with st.chat_message("assistant"):
+                st.error(f"We've hit today's usage limit ({MAX_DAILY_REQUESTS} requests). Please try again tomorrow.")
+            return
+
+        st.session_state.question_count += 1
 
         with st.status("Searching document...", expanded=False):
             results = search(prompt, st.session_state.chunks, st.session_state.embeddings)

@@ -35,8 +35,16 @@ Upload a PDF, ask questions about it, and get answers grounded in the document's
 
 4. Open the URL Streamlit prints (usually http://localhost:8501), upload a PDF, and start asking questions.
 
+## Limits and cost protection
+
+- 7 pages / 10 MB per PDF, and uploads are checked for a real PDF file signature, not just the `.pdf` extension.
+- 10 questions per session (`MAX_SESSION_QUESTIONS`) — refresh the page to start a new session.
+- A shared daily cap of 200 paid requests (`MAX_DAILY_REQUESTS`) across all users, as a hard ceiling on OpenAI/LandingAI spend regardless of traffic. Both are configurable via env vars — see `.env.example`.
+- Identical PDFs (by content hash) are parsed and embedded only once and reused across all users/sessions, so re-uploading a popular document (e.g. a well-known app's ToS) doesn't re-pay for it.
+- This is process-wide, in-memory tracking — fine for the single-instance deployment this is built for, but wouldn't hold up behind multiple app instances/workers without a shared store (Redis, a database) backing it instead.
+
 ## Notes
 
-- Everything is kept in-memory for the current session — nothing is persisted to disk. Uploading a new PDF re-indexes and replaces the previous one.
+- Everything else is kept in-memory for the current session — nothing is persisted to disk. Uploading a new PDF re-indexes and replaces the previous one.
 - Scanned PDFs without a text layer won't extract any text; LandingAI's extraction does OCR, but a page that's entirely a photo/scan with no legible text still won't produce useful content.
-- Each upload costs a small number of LandingAI credits (roughly 1/page) — negligible at the 7-page cap.
+- Each upload costs a small number of LandingAI credits (roughly 1/page) — negligible at the 7-page cap, and only paid once per unique document thanks to the cache above.
