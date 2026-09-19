@@ -8,6 +8,7 @@ import numpy as np
 import streamlit as st
 import tiktoken
 from dotenv import load_dotenv
+from landingai_ade import LandingAIADE, LandingAiadeError
 from openai import OpenAI
 from pypdf import PdfReader
 
@@ -20,15 +21,36 @@ CHUNK_OVERLAP = 75
 TOP_K = 8
 FETCH_K = 25
 MMR_LAMBDA = 0.5
+MAX_PAGES = 7
+MAX_FILE_MB = 10
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
 client = OpenAI()
+ade_client = LandingAIADE()  # reads VISION_AGENT_API_KEY
 encoding = tiktoken.get_encoding("cl100k_base")
 
 
-def extract_pages(file_bytes: bytes) -> List[str]:
-    """Return a list of page texts, index 0 = page 1."""
-    reader = PdfReader(io.BytesIO(file_bytes))
-    return [page.extract_text() or "" for page in reader.pages]
+def get_page_count(file_bytes: bytes) -> int:
+    return len(PdfReader(io.BytesIO(file_bytes)).pages)
+
+
+def extract_pages(filename: str, file_bytes: bytes) -> List[str]:
+    """Parse the PDF with LandingAI's Agentic Document Extraction, which reconstructs
+    real table structure (rows, columns, merged cells) instead of flattening tables
+    into disconnected text like plain PDF text extraction does. Returns one markdown
+    string per page."""
+    try:
+        parsed = ade_client.v2.parse(
+            document=(filename, file_bytes, "application/pdf"),
+            options={"inline_markdown": True},
+        )
+    except LandingAiadeError as e:
+        st.error(f"Couldn't parse this PDF: {e}")
+        return []
+
+    if parsed.structure and parsed.structure.children:
+        return [page.markdown or "" for page in parsed.structure.children]
+    return [parsed.markdown or ""]
 
 
 def chunk_pages(pages: List[str]) -> List[dict]:
@@ -129,12 +151,27 @@ def get_chat_response(messages: List[dict], context: str):
     return st.write_stream(stream)
 
 
-def process_pdf(file_bytes: bytes):
+def process_pdf(filename: str, file_bytes: bytes):
+    if len(file_bytes) > MAX_FILE_BYTES:
+        size_mb = len(file_bytes) / (1024 * 1024)
+        st.error(f"This file is {size_mb:.1f} MB, over the {MAX_FILE_MB} MB limit.")
+        return None, None
+
+    try:
+        page_count = get_page_count(file_bytes)
+    except Exception:
+        st.error("Couldn't read this file. Is it a valid PDF?")
+        return None, None
+
+    if page_count > MAX_PAGES:
+        st.error(f"This PDF has {page_count} pages; the limit is {MAX_PAGES} pages for now.")
+        return None, None
+
     with st.spinner("Reading and indexing PDF..."):
-        pages = extract_pages(file_bytes)
+        pages = extract_pages(filename, file_bytes)
         chunks = chunk_pages(pages)
         if not chunks:
-            st.error("Couldn't extract any text from this PDF. It may be scanned images without OCR text.")
+            st.error("Couldn't extract any text from this PDF. It may be scanned images without a text layer.")
             return None, None
         embeddings = embed_texts([c["text"] for c in chunks])
     return chunks, embeddings
@@ -151,14 +188,18 @@ def main():
         st.session_state.embeddings = None
         st.session_state.messages = []
 
-    uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+    uploaded_file = st.file_uploader(
+        "Upload a PDF",
+        type=["pdf"],
+        help=f"Max {MAX_PAGES} pages, {MAX_FILE_MB} MB.",
+    )
 
     if uploaded_file is not None:
         file_bytes = uploaded_file.read()
         file_hash = hashlib.sha256(file_bytes).hexdigest()
 
         if file_hash != st.session_state.file_hash:
-            chunks, embeddings = process_pdf(file_bytes)
+            chunks, embeddings = process_pdf(uploaded_file.name, file_bytes)
             st.session_state.file_hash = file_hash
             st.session_state.chunks = chunks
             st.session_state.embeddings = embeddings

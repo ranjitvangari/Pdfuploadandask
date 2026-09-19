@@ -1,6 +1,7 @@
 streamlit
 openai
 pypdf
+landingai-ade
 python-dotenv
 numpy
 tiktoken
